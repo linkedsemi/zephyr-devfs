@@ -1,0 +1,3 @@
+config ZEPHYR_DEVFS_DRIVER
+    default n
+    bool "use devfs driver"
