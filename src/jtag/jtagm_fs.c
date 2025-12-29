@@ -6,6 +6,7 @@
  */
 
 #include <stdarg.h>
+#include <stdio.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/fs/fs_sys.h>
 #include <zephyr/device.h>
@@ -183,8 +184,14 @@ static const struct fs_file_system_t jtagm_fs = {
 
 int jtagm_fs_init(void)
 {
-    devfs_register("/dev/jtag1", &jtagm_fs);
-    devfs_register("/dev/jtag3", &jtagm_fs);
+    char name[32];
+
+    for (int i = 0; i < JTAGM_NUM; i++)
+    {
+        snprintf(name, sizeof(name) - 1, "/dev/%s", jtag_devices[i].label);
+        devfs_register(name, &jtagm_fs);
+    }
+
     return 0;
 }
 
