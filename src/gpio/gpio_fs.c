@@ -756,7 +756,7 @@ static const struct fs_file_system_t gpio_chip = {
     .ioctl = gpio_chip_ioctl
 };
 
-static int gpio_fs_init(void)
+int gpio_fs_init(void)
 {
     char name[32];
 

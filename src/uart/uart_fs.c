@@ -3,7 +3,6 @@
 #include <zephyr/fs/fs.h>
 #include <zephyr/fs/fs_sys.h>
 #include <zephyr/device.h>
-#include <zephyr/devicetree.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/posix/fcntl.h>
@@ -15,8 +14,6 @@
 #include <zephyr/sys/ring_buffer.h>
 
 LOG_MODULE_REGISTER(uart_dev, LOG_LEVEL_INF);
-
-#define UART_FS_RB_SIZE                         (1024)
 
 #define UART_DEVICE_NUM \
         (DT_NUM_INST_STATUS_OKAY(ns16550) + \
@@ -35,8 +32,6 @@ LOG_MODULE_REGISTER(uart_dev, LOG_LEVEL_INF);
     {                                                    \
         .dev = DEVICE_DT_GET(node_id),                   \
         .label = DT_PROP(node_id, label),                \
-        .is_open = ATOMIC_INIT(0),                       \
-        .fs_flag = 0,                                    \
     },
 
 struct uart_device
@@ -80,8 +75,9 @@ static void uart_rx_handle(struct uart_device *uart_dev)
         }
         else
         {
-            /* buffer full !! */
-            LOG_ERR("buffer full!!!\n");
+            uint8_t dummy;
+            rx_len = uart_fifo_read(uart_dev->dev, &dummy, 1);
+            printk("rx rb full !!\n");
         }
     } while (rx_len && (rx_len <= buf_len));
 
@@ -119,11 +115,13 @@ static void uart_irq(const struct device *dev, void *user_data)
     struct uart_device *uart = user_data;
     uart_irq_update(uart->dev);
 
-    if (uart_irq_rx_ready(uart->dev)) {
+    if (uart_irq_rx_ready(uart->dev))
+    {
         uart_rx_handle(uart);
     }
 
-    if (uart_irq_tx_ready(uart->dev)) {
+    if (uart_irq_tx_ready(uart->dev))
+    {
         uart_tx_handle(uart);
     }
 }
@@ -225,6 +223,12 @@ static int uart_ioctl(struct fs_file_t* zfp, unsigned long request, va_list args
             (*pev)->mode = K_POLL_MODE_NOTIFY_ONLY;
             (*pev)->state = K_POLL_STATE_NOT_READY;
             (*pev)++;
+
+            if (ring_buf_size_get(&dev->rx_rb))
+            {
+                /* rasie signal */
+                k_poll_signal_raise(&dev->signal, 1);
+            }
         }
     }
     break;
@@ -234,7 +238,8 @@ static int uart_ioctl(struct fs_file_t* zfp, unsigned long request, va_list args
         struct k_poll_event** pev = va_arg(args, struct k_poll_event**);
         if (pfd->events & ZVFS_POLLIN)
         {
-            if ((*pev)->state != K_POLL_STATE_NOT_READY ) {
+            if ((*pev)->state == K_POLL_STATE_SIGNALED)
+            {
                 pfd->revents |= ZVFS_POLLIN;
                 (*pev)->state = K_POLL_STATE_NOT_READY;
                 k_poll_signal_reset(&dev->signal);
@@ -267,7 +272,9 @@ static ssize_t uart_read(struct fs_file_t *filp, void *dest, size_t nbytes)
         }
 
         if (nonblock)
+        {
             break;
+        }
 
         k_sem_take(&uart_dev->rx_sem, K_FOREVER);
     }
@@ -307,6 +314,7 @@ static ssize_t uart_write(struct fs_file_t *filp, const void *src, size_t size)
 
     return total;
 }
+
 static const struct fs_file_system_t uart_fs = {
     .open = uart_open,
     .close = uart_close,
@@ -323,7 +331,6 @@ static int uart_fs_init(void)
         snprintf(name, sizeof(name) - 1, "/dev/%s", uart_devices[i].label);
         devfs_register(name, &uart_fs);
     }
-
 
     return 0;
 }
