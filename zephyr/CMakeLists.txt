@@ -9,6 +9,10 @@ if(CONFIG_SOC_LSQSH_CPU1)
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/jtag/jtagm_testcase.c
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/uart/uart_fs.c
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/uart/uart_testcase.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_adc.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_adc_testcase.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_i2c.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_i2c_testcase.c
     )
 
     zephyr_library_include_directories(${ZEPHYR_CURRENT_MODULE_DIR}/)
