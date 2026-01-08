@@ -120,24 +120,35 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
     switch (cmd)
     {
     case JTAG_SIOCSTATE:
-        struct jtag_tap_state *tapstate = va_arg(args, struct jtag_tap_state *);
-        ret = jtag_tap_set(jtag->dev, usr_state_2_kernel_state[tapstate->endstate]);
+        {
+            struct jtag_tap_state *tapstate = va_arg(args, struct jtag_tap_state *);
+            enum tap_state state = usr_state_2_kernel_state[tapstate->endstate];
+            ret = jtag_tap_set(jtag->dev, state);
+            LOG_DBG("set tap state %d", state);
+        }
         break;
     case JTAG_IOCXFER:
-        struct jtag_xfer *xfer = va_arg(args, struct jtag_xfer *);
-        if (xfer->type == JTAG_SIR_XFER)
         {
-            ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, TAP_IDLE);
-        }
-        else
-        {
-            ret = jtag_dr_scan(jtag->dev, xfer->length, NULL, (uint8_t *)(uintptr_t)xfer->tdio, TAP_IDLE);
+            struct jtag_xfer *xfer = va_arg(args, struct jtag_xfer *);
+            if (xfer->type == JTAG_SIR_XFER)
+            {
+                ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, TAP_IDLE);
+                LOG_DBG("ir shift");
+            }
+            else
+            {
+                ret = jtag_dr_scan(jtag->dev, xfer->length, (uint8_t *)(uintptr_t)xfer->tdio, (uint8_t *)(uintptr_t)xfer->tdio, TAP_IDLE);
+                LOG_DBG("dr shift");
+            }
         }
         break;
     case JTAG_GIOCSTATUS:
-        enum jtag_tapstate *state = va_arg(args, enum jtag_tapstate *);
-        ret = jtag_tap_get(jtag->dev, (enum tap_state *)state);
-        *state = kernel_state_2_usr_state[*(enum tap_state *)state];
+        {
+            enum jtag_tapstate *state = va_arg(args, enum jtag_tapstate *);
+            ret = jtag_tap_get(jtag->dev, (enum tap_state *)state);
+            *state = kernel_state_2_usr_state[*(enum tap_state *)state];
+            LOG_DBG("get tap state %d", *state);
+        }
         break;
     case JTAG_SIOCMODE:
         {
@@ -151,19 +162,24 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
             default:
                 return -EINVAL;
             }
+            LOG_DBG("set transfer mode %d", mode->feature);
         }
         break;
     case JTAG_SIOCFREQ:
         freq = va_arg(args, uint32_t *);
         ret = jtag_freq_set(jtag->dev, *freq);
+        LOG_DBG("set freq %d", *freq);
         break;
     case JTAG_GIOCFREQ:
         freq = va_arg(args, uint32_t *);
         ret = jtag_freq_get(jtag->dev, freq);
+        LOG_DBG("get freq %d", *freq);
         break;
     case JTAG_IOCBITBANG:
+        LOG_DBG("set bitbang");
         break;
     case JTAG_SIOCTRST:
+        LOG_DBG("set trst");
         break;
     case ZFD_IOCTL_SET_LOCK:
         // caller is open, ignore it
