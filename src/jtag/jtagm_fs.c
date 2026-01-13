@@ -129,15 +129,16 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
         break;
     case JTAG_IOCXFER:
         {
+            /* TODO: handle xfer->padding (currently ignored) */
             struct jtag_xfer *xfer = va_arg(args, struct jtag_xfer *);
             if (xfer->type == JTAG_SIR_XFER)
             {
-                ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, TAP_IDLE);
+                ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, usr_state_2_kernel_state[xfer->endstate]);
                 LOG_DBG("ir shift");
             }
             else
             {
-                ret = jtag_dr_scan(jtag->dev, xfer->length, (uint8_t *)(uintptr_t)xfer->tdio, (uint8_t *)(uintptr_t)xfer->tdio, TAP_IDLE);
+                ret = jtag_dr_scan(jtag->dev, xfer->length, (uint8_t *)(uintptr_t)xfer->tdio, (uint8_t *)(uintptr_t)xfer->tdio, usr_state_2_kernel_state[xfer->endstate]);
                 LOG_DBG("dr shift");
             }
         }
