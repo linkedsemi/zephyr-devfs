@@ -16,6 +16,7 @@
 #include <jtag/jtagm_fs.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "ls_soc_gpio.h"
 
 static int jtag_shift_ir(int fd, uint32_t ir_value, int ir_len)
 {
@@ -95,6 +96,103 @@ static int jtag_get_freq(int fd)
     return freq;
 }
 
+static int jtag_wait_cycle(int fd, uint32_t cycles)
+{
+    struct tck_bitbang bitbang[cycles];
+    memset(bitbang, 0, sizeof (bitbang));
+
+    struct bitbang_packet packet = {
+        .length = cycles,
+        .data = bitbang
+    };
+
+    for (int i = 0; i < cycles; i++)
+    {
+        bitbang[i].tdi = i % 2;
+    }
+
+    return ioctl(fd, JTAG_IOCBITBANG, &packet);
+}
+
+static int jtag_bitbang(const struct shell *sh, size_t argc, char **argv)
+{
+    if (argc < 2)
+    {
+        printf("Used:\n");
+        printf("    %s [num_bit] \n", argv[0]);
+        return 0;
+    }
+
+    uint32_t num_bit = strtoul(argv[1], NULL, 0);
+    printf("num_bit = %d\n", num_bit);
+    per_func0_set(PD13, 28);
+
+    int fd = open("/dev/jtag1", O_RDWR);
+
+    jtag_wait_cycle(fd, num_bit);
+
+    close(fd);
+
+    return 0;
+}
+SHELL_CMD_REGISTER(jtag_bitbang, NULL, "jtag_bitbang", jtag_bitbang);
+
+static int jtag_ir_padding(const struct shell *sh, size_t argc, char **argv)
+{
+    struct jtag_xfer xfer = {0};
+    uint32_t tdio = 0xaa;
+    per_func0_set(PD13, 28);
+
+    int fd = open("/dev/jtag1", O_RDWR);
+
+    union pad_config padding;
+    padding.pre_pad_number = 5;
+    padding.post_pad_number = 5;
+    padding.pad_data = 1;
+
+    xfer.type = JTAG_SIR_XFER;
+    xfer.length = 5;
+    xfer.direction = JTAG_WRITE_XFER;
+    xfer.tdio = (uintptr_t)&tdio;
+    xfer.endstate = JTAG_STATE_IDLE;
+    xfer.padding = padding.int_value;
+
+    ioctl(fd, JTAG_IOCXFER, &xfer);
+    close(fd);
+
+    return 0;
+}
+SHELL_CMD_REGISTER(jtag_ir_padding, NULL, "jtag_ir_padding", jtag_ir_padding);
+
+static int jtag_dr_padding(const struct shell *sh, size_t argc, char **argv)
+{
+    struct jtag_xfer xfer = {0};
+    uint32_t tdio = 0xaa;
+
+    per_func0_set(PD13, 28);
+
+    int fd = open("/dev/jtag1", O_RDWR);
+
+    union pad_config padding;
+
+    padding.pre_pad_number = 5;
+    padding.post_pad_number = 5;
+    padding.pad_data = 1;
+
+    xfer.type = JTAG_SDR_XFER;
+    xfer.length = 5;
+    xfer.direction = JTAG_WRITE_XFER;
+    xfer.tdio = (uintptr_t)&tdio;
+    xfer.endstate = JTAG_STATE_IDLE;
+    xfer.padding = padding.int_value;
+
+    ioctl(fd, JTAG_IOCXFER, &xfer);
+    close(fd);
+
+    return 0;
+}
+SHELL_CMD_REGISTER(jtag_dr_padding, NULL, "jtag_dr_padding", jtag_dr_padding);
+
 static int jtag_fs_read_idcode(const struct shell *sh, size_t argc, char **argv)
 {
     enum jtag_tapstate state;
@@ -111,12 +209,14 @@ static int jtag_fs_read_idcode(const struct shell *sh, size_t argc, char **argv)
     uint32_t command = strtoul(argv[2], NULL, 16);
     printf("num_bit = %d, command = %x\n", num_bit, command);
 
+    per_func0_set(PD13, 28);
+
     int fd = open("/dev/jtag1", O_RDWR);
     if (fd > 0)
     {
         printf("cur freq: %d\n", jtag_get_freq(fd));
-        printf("set freq: %d\n", 5000000);
-        jtag_set_freq(fd, 5000000);
+        printf("set freq: %d\n", 15000000);
+        jtag_set_freq(fd, 15000000);
         printf("get freq: %d\n", jtag_get_freq(fd));
 
         jtag_set_tap_state(fd, JTAG_STATE_IDLE);

@@ -19,18 +19,20 @@
 #include <zephyr/fs/devfs.h>
 #include <linux/ioctl.h>
 #include <jtag/jtagm_fs.h>
-#include "ls_soc_gpio.h"
 
 #define DT_DRV_COMPAT linkedsemi_ls_jtag
 
 LOG_MODULE_REGISTER(jtagm_dev, LOG_LEVEL_INF);
 #define JTAGM_NUM       DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT)
 
+#define ASPEED_JTAG_MAX_PAD_SIZE            512
+
 struct jtagm_device
 {
     const struct device *dev;
     const char *label;
     atomic_t is_open;
+    uint32_t pad_data[ASPEED_JTAG_MAX_PAD_SIZE / 32];
 };
 
 #define JTAGM_DEVICE_PROCESS(inst)                            \
@@ -57,7 +59,6 @@ static int jtagm_open(struct fs_file_t *zfp, const char *name, fs_mode_t flags)
         }
     }
 
-
     if (!jtag || !device_is_ready(jtag->dev))
     {
         LOG_ERR("Device %s not ready", name);
@@ -74,12 +75,6 @@ static int jtagm_open(struct fs_file_t *zfp, const char *name, fs_mode_t flags)
     {
         LOG_ERR("Device %s reset fail", name);
         return -EBUSY; 
-    }
-
-    if (strcmp(name, "jtag1") == 0)
-    {
-        /* workround */
-        per_func0_set(PD13, 28);
     }
 
     zfp->filep = jtag;
@@ -129,16 +124,44 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
         break;
     case JTAG_IOCXFER:
         {
-            /* TODO: handle xfer->padding (currently ignored) */
             struct jtag_xfer *xfer = va_arg(args, struct jtag_xfer *);
+            union pad_config pad = (union pad_config)xfer->padding;
+
+            if (pad.int_value)
+                memset(jtag->pad_data, pad.pad_data ? 0xff : 0x00, sizeof(jtag->pad_data));
+
             if (xfer->type == JTAG_SIR_XFER)
             {
-                ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, usr_state_2_kernel_state[xfer->endstate]);
+                if (pad.pre_pad_number)
+                    ret = jtag_ir_scan(jtag->dev, pad.pre_pad_number, (const uint8_t *)jtag->pad_data, NULL, TAP_IRSHIFT);
+
+                ret = jtag_ir_scan(jtag->dev, xfer->length, (const uint8_t *)(uintptr_t)xfer->tdio, NULL, 
+                                        pad.post_pad_number ? TAP_IRSHIFT : usr_state_2_kernel_state[xfer->endstate]);
+
+                if (pad.post_pad_number)
+                    ret = jtag_ir_scan(jtag->dev, 
+                                    pad.post_pad_number, 
+                                    (const uint8_t *)jtag->pad_data, 
+                                    NULL, 
+                                    usr_state_2_kernel_state[xfer->endstate]);
+
                 LOG_DBG("ir shift");
-            }
+            } 
             else
             {
-                ret = jtag_dr_scan(jtag->dev, xfer->length, (uint8_t *)(uintptr_t)xfer->tdio, (uint8_t *)(uintptr_t)xfer->tdio, usr_state_2_kernel_state[xfer->endstate]);
+                if (pad.pre_pad_number)
+                    ret = jtag_dr_scan(jtag->dev, pad.pre_pad_number, (const uint8_t *)jtag->pad_data, NULL, TAP_DRSHIFT);
+
+                ret = jtag_dr_scan(jtag->dev, xfer->length, (uint8_t *)(uintptr_t)xfer->tdio, (uint8_t *)(uintptr_t)xfer->tdio,
+                                         pad.post_pad_number ? TAP_DRSHIFT : usr_state_2_kernel_state[xfer->endstate]);
+
+                if (pad.post_pad_number)
+                    ret = jtag_dr_scan(jtag->dev,
+                                    pad.post_pad_number,
+                                    (const uint8_t *)jtag->pad_data,
+                                    NULL,
+                                    usr_state_2_kernel_state[xfer->endstate]);
+
                 LOG_DBG("dr shift");
             }
         }
@@ -177,14 +200,17 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
         LOG_DBG("get freq %d", *freq);
         break;
     case JTAG_IOCBITBANG:
-        LOG_DBG("set bitbang");
+        {
+            struct bitbang_packet *packet = (struct bitbang_packet *)va_arg(args, struct bitbang_packet *);
+            LOG_DBG("set bitbang, num_bit: %d", packet->length);
+            for (int i = 0; i < packet->length; i++)
+            {
+                packet->data[i].tdo = jtag_tck_run_cycle(jtag->dev, packet->data[i].tms, packet->data[i].tdi);
+            }
+        }
         break;
     case JTAG_SIOCTRST:
         LOG_DBG("set trst");
-        break;
-    case ZFD_IOCTL_SET_LOCK:
-        // caller is open, ignore it
-        ret = 0;
         break;
     default:
         return -EINVAL;
