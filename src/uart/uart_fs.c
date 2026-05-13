@@ -101,13 +101,11 @@ static void uart_tx_handle(struct uart_device *uart_dev)
         if (len > 0)
         {
             k_sem_give(&uart_dev->tx_sem);
+            uart_irq_tx_disable(uart_dev->dev);
+            atomic_set(&uart_dev->tx_busy, 0);
         }
     }
-    else
-    {
-        uart_irq_tx_disable(uart_dev->dev);
-        atomic_set(&uart_dev->tx_busy, 0);
-    }
+
 }
 
 static void uart_irq(const struct device *dev, void *user_data)
