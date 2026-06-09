@@ -1,3 +1,15 @@
 config ZEPHYR_DEVFS_DRIVER
     default n
     bool "use devfs driver"
+
+if ZEPHYR_DEVFS_DRIVER
+
+config I2C_DEV_LOG_LEVEL
+    int "i2c_dev log level"
+    range 0 4
+    default 1
+    help
+        Log level for i2c_dev module
+
+endif # ZEPHYR_DEVFS_DRIVER
+ 
