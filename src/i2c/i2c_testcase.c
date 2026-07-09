@@ -20,7 +20,7 @@
 
 #include <linux/ioctl.h>
 
-#define TEST_I2C_DEV "/dev/i2c-2"
+#define TEST_I2C_DEV "/dev/i2c-5"
 #define TEST_ADDR 0x50
 #define TEST_RETRIES 3
 #define TEST_TIMEOUT 100

@@ -518,12 +518,12 @@ static int i2cdev_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
                                       (lf & I2C_M_TEN ? I2C_MSG_ADDR_10_BITS : 0) |
                                       (lf & I2C_M_NOSTART ? 0 : I2C_MSG_RESTART) |
                                       (lf & I2C_M_STOP ? I2C_MSG_STOP : 0));
-            if (i == 0)
-            {
-                msgs[i].flags |= I2C_MSG_RESTART;
-            }
+            // if (i == 0)
+            // {
+            //     msgs[i].flags |= I2C_MSG_RESTART;
+            // }
         }
-        // msgs[rdwr_arg->nmsgs - 1].flags |= I2C_MSG_STOP;
+        msgs[rdwr_arg->nmsgs - 1].flags |= I2C_MSG_STOP;
 
         int result = i2c_transfer(i2c->dev, msgs, nmsgs_sent, rdwr_arg->msgs[0].addr);
 
