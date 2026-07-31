@@ -52,6 +52,7 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/sensor/caseopen_ls.h>
 
 #define DT_DRV_COMPAT linkedsemi_hwmon
 
@@ -62,6 +63,7 @@ enum hwmon_sensor_type {
 	HWMON_TYPE_NONE = 0,   /* legacy: no sensor-type property (deprecated) */
 	HWMON_TYPE_TEMP,
 	HWMON_TYPE_PSU,
+	HWMON_TYPE_INTRUSION,
 	/* NVMe is intentionally NOT a hwmon type: in native OpenBMC the NVMe
 	 * drive temperature is read via NVMe-MI by the dedicated NVMeSensor
 	 * daemon, not through hwmon tempX_input files. */
@@ -81,6 +83,15 @@ struct hwmon_i2c_client {
 	const struct device *bus;
 	uint32_t addr;
 };
+
+/* The hwmon node can reference a sensor device via hwmon-ins. If that sensor
+ * is on an I2C bus (temp/psu) we derive the bus/addr for the legacy bus_addr
+ * file; if it is an on-SOC peripheral (intrusion/caseopen) there is no I2C
+ * controller and DT_BUS would not expand, so leave bus NULL / addr 0.
+ */
+#define HWMON_SENSOR_IS_I2C(inst)                                         \
+	UTIL_AND(DT_INST_NODE_HAS_PROP(inst, sensor_type),               \
+		 DT_ON_BUS(DT_INST_PHANDLE_BY_IDX(inst, hwmon_ins, 0), i2c))
 
 /* ---- per-instance channel (runtime) ---- */
 struct hwmon_channel {
@@ -115,8 +126,11 @@ struct hwmon_dev {
 	struct sysfs_node *node;
 	struct sysfs_attribute name_attr;
 	struct sysfs_attribute bus_addr_attr;
+	struct sysfs_attribute label_attr;
+	struct sysfs_attribute rearm_attr;
 	int name_ppos;
 	int bus_ppos;
+	int label_ppos;
 };
 
 /* ---- device table ----
@@ -163,18 +177,18 @@ struct hwmon_dev {
 			(DEVICE_DT_GET(DT_INST_PHANDLE_BY_IDX(            \
 				inst, hwmon_ins, 0))),                    \
 			(NULL)),                                            \
-		.client = {                                              \
-			.bus = COND_CODE_1(                             \
-				DT_INST_NODE_HAS_PROP(inst, sensor_type), \
-				(DEVICE_DT_GET(DT_BUS(DT_INST_PHANDLE_BY_IDX( \
-					inst, hwmon_ins, 0)))),          \
-				(NULL)),                                \
-			.addr = COND_CODE_1(                            \
-				DT_INST_NODE_HAS_PROP(inst, sensor_type), \
-				(DT_REG_ADDR(DT_INST_PHANDLE_BY_IDX(     \
-					inst, hwmon_ins, 0))),            \
-				(0)),                                  \
-		},                                                         \
+	.client = {                                              \
+		.bus = COND_CODE_1(                             \
+			HWMON_SENSOR_IS_I2C(inst),                \
+			(DEVICE_DT_GET(DT_BUS(DT_INST_PHANDLE_BY_IDX( \
+				inst, hwmon_ins, 0)))),          \
+			(NULL)),                                \
+		.addr = COND_CODE_1(                            \
+			HWMON_SENSOR_IS_I2C(inst),                \
+			(DT_REG_ADDR(DT_INST_PHANDLE_BY_IDX(     \
+				inst, hwmon_ins, 0))),            \
+			(0)),                                  \
+	},                                                         \
 		.files = HWMON_FILES(inst),                               \
 		.file_count = DT_INST_PROP_LEN_OR(inst, meas, 0),          \
 	},
@@ -208,6 +222,9 @@ static enum hwmon_sensor_type hwmon_type_from_str(const char *s)
 	if (!strcmp(s, "psu")) {
 		return HWMON_TYPE_PSU;
 	}
+	if (!strcmp(s, "intrusion")) {
+		return HWMON_TYPE_INTRUSION;
+	}
 	return HWMON_TYPE_NONE;
 }
 
@@ -219,6 +236,8 @@ static const char *hwmon_name_for_type(enum hwmon_sensor_type t)
 		return "temp";
 	case HWMON_TYPE_PSU:
 		return "pmbus";
+	case HWMON_TYPE_INTRUSION:
+		return "intrusion";
 	default:
 		return "hwmon";
 	}
@@ -283,12 +302,13 @@ static int hwmon_chan_from_name(const char *name, enum sensor_channel *chan,
 				int *num)
 {
 	unsigned int n;
-	char prefix[8];
+	char prefix[16];
 	enum sensor_channel c;
 
 	/* e.g. "in3_input", "curr2_input", "power1_input", "temp1_input",
-	 * "fan1_input": a non-digit prefix, then a number, then "_input". */
-	if (sscanf(name, "%7[^0-9]%u_input", prefix, &n) < 2) {
+	 * "fan1_input", "intrusion1_input": a non-digit prefix, then a
+	 * number, then "_input". */
+	if (sscanf(name, "%15[^0-9]%u_input", prefix, &n) < 2) {
 		return -EINVAL;
 	}
 
@@ -302,6 +322,8 @@ static int hwmon_chan_from_name(const char *name, enum sensor_channel *chan,
 		c = SENSOR_CHAN_AMBIENT_TEMP;
 	} else if (!strcmp(prefix, "fan")) {
 		c = SENSOR_CHAN_RPM;
+	} else if (!strcmp(prefix, "intrusion")) {
+		c = SENSOR_CHAN_INTRUSION;
 	} else {
 		return -EINVAL;
 	}
@@ -315,8 +337,10 @@ static int hwmon_chan_from_name(const char *name, enum sensor_channel *chan,
 /* forward declarations of the sysfs ops structs (defined below) */
 static struct sysfs_attribute_ops chan_attr_ops;
 static struct sysfs_attribute_ops label_attr_ops;
+static struct sysfs_attribute_ops dev_label_attr_ops;
 static struct sysfs_attribute_ops name_attr_ops;
 static struct sysfs_attribute_ops bus_addr_ops;
+static struct sysfs_attribute_ops rearm_attr_ops;
 
 static void hwmon_dev_setup(struct hwmon_dev *dev)
 {
@@ -389,7 +413,10 @@ static ssize_t chan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 
 	struct hwmon_dev *dev = ch->dev;
 
-	if (hwmon_ensure_fresh(dev) < 0) {
+	int ret = hwmon_ensure_fresh(dev);
+	if (ret < 0) {
+		LOG_ERR("%s: %s ensure_fresh failed (%d)", dev->label,
+			ch->filename, ret);
 		return -EIO;
 	}
 
@@ -401,16 +428,17 @@ static ssize_t chan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 	int num;
 
 	if (hwmon_chan_from_name(ch->filename, &chan, &num) < 0) {
-		LOG_DBG("%s: unrecognised hwmon file %s", dev->label,
+		LOG_ERR("%s: unrecognised hwmon file %s", dev->label,
 			ch->filename);
 		return -EIO;
 	}
 
 	struct sensor_value val = { .val2 = num - 1 };
-	int ret = sensor_channel_get(dev->sensor_dev, chan, &val);
+	ret = sensor_channel_get(dev->sensor_dev, chan, &val);
 
 	if (ret < 0) {
-		LOG_DBG("%s: %s read failed (%d)", dev->label, ch->filename, ret);
+		LOG_ERR("%s: %s channel_get failed (%d)", dev->label,
+			ch->filename, ret);
 		return -EIO;
 	}
 
@@ -566,6 +594,48 @@ static struct sysfs_attribute_ops label_attr_ops = {
 	.close = label_attr_close,
 };
 
+/* ---- device label attribute ops ----
+ * A device-level "label" file with the DT `label` property value so
+ * dbus-sensors can identify the hwmon node by its HwmonLabel. */
+static int dev_label_attr_open(sysfs_attr_t attr)
+{
+	struct hwmon_dev *dev = attr->user_data;
+
+	dev->label_ppos = 0;
+	return 0;
+}
+
+static ssize_t dev_label_attr_read(sysfs_attr_t attr, void *buf, size_t size)
+{
+	struct hwmon_dev *dev = attr->user_data;
+
+	if (dev->label_ppos > 0) {
+		return 0;
+	}
+
+	int len = snprintf(buf, size, "%s\n", dev->label);
+
+	if (len > 0) {
+		dev->label_ppos = len;
+	}
+	return len;
+}
+
+static int dev_label_attr_close(sysfs_attr_t attr)
+{
+	struct hwmon_dev *dev = attr->user_data;
+
+	dev->label_ppos = 0;
+	return 0;
+}
+
+static struct sysfs_attribute_ops dev_label_attr_ops = {
+	.open = dev_label_attr_open,
+	.read = dev_label_attr_read,
+	.write = NULL,
+	.close = dev_label_attr_close,
+};
+
 /* ---- name attribute ops ---- */
 static int name_attr_open(sysfs_attr_t attr)
 {
@@ -647,6 +717,50 @@ static struct sysfs_attribute_ops bus_addr_ops = {
 	.close = bus_addr_close,
 };
 
+/* ---- rearm attribute ops (intrusion-only) ----
+ * Writing anything to this file triggers a hardware latch clear on the
+ * underlying caseopen sensor. */
+static int rearm_attr_open(sysfs_attr_t attr)
+{
+	return 0;
+}
+
+static ssize_t rearm_attr_write(sysfs_attr_t attr, const void *buf,
+				size_t size)
+{
+	struct hwmon_dev *dev = attr->user_data;
+	struct sensor_value val;
+
+	if (!dev->sensor_dev) {
+		return -ENODEV;
+	}
+
+	val.val1 = 0;
+	val.val2 = 0;
+	int ret = sensor_attr_set(dev->sensor_dev, SENSOR_CHAN_INTRUSION,
+				  SENSOR_ATTR_CASEOPEN_REARM, &val);
+
+	if (ret < 0) {
+		LOG_ERR("%s: rearm failed (%d)", dev->label, ret);
+		return ret;
+	}
+
+	LOG_INF("%s: rearmed", dev->label);
+	return (ssize_t)size;
+}
+
+static int rearm_attr_close(sysfs_attr_t attr)
+{
+	return 0;
+}
+
+static struct sysfs_attribute_ops rearm_attr_ops = {
+	.open = rearm_attr_open,
+	.read = NULL,
+	.write = rearm_attr_write,
+	.close = rearm_attr_close,
+};
+
 /* ---- fs init ---- */
 static int hwmon_fs_init(void)
 {
@@ -693,6 +807,19 @@ static int hwmon_fs_init(void)
 		dev->name_attr.user_data = dev;
 		dev->name_attr.ops = &name_attr_ops;
 		sysfs_add_attribute(dev->node, &dev->name_attr);
+
+		snprintf(dev->label_attr.name, SYSFS_ATTRIBUTE_NAME_MAX, "label");
+		dev->label_attr.user_data = dev;
+		dev->label_attr.ops = &dev_label_attr_ops;
+		sysfs_add_attribute(dev->node, &dev->label_attr);
+
+		if (dev->type == HWMON_TYPE_INTRUSION) {
+			snprintf(dev->rearm_attr.name,
+				 SYSFS_ATTRIBUTE_NAME_MAX, "rearm");
+			dev->rearm_attr.user_data = dev;
+			dev->rearm_attr.ops = &rearm_attr_ops;
+			sysfs_add_attribute(dev->node, &dev->rearm_attr);
+		}
 
 		snprintf(dev->bus_addr_attr.name, SYSFS_ATTRIBUTE_NAME_MAX,
 			 "bus_addr");
