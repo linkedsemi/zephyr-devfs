@@ -13,6 +13,7 @@ if(CONFIG_SOC_LSQSH_CPU1)
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_adc_testcase.c
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_i2c.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_i2c_testcase.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_pwm_tach.c
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/i2c/i2c_fs.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/i2c/i2c_testcase.c
     )

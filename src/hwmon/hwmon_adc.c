@@ -77,7 +77,6 @@ static struct hwmon_dev hwmon_devices[] = {
 static int adc_attr_open(sysfs_attr_t attr)
 {
     struct hwmon_adc *adc = attr->user_data;
-    k_poll_signal_init(&adc->poll_signal);
     adc->ppos = 0;
 
     if (!adc->inited)
@@ -93,6 +92,9 @@ static int adc_attr_open(sysfs_attr_t attr)
             LOG_ERR("%s channel (%d) setup fail.", adc->dev->name, adc->channel);
             return ret;
         }
+
+        k_poll_signal_init(&adc->poll_signal);
+
         adc->inited = 1;
     }
     LOG_DBG("%s channel (%d) opend.", adc->dev->name, adc->channel);
