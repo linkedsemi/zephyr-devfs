@@ -56,7 +56,7 @@
 
 #define DT_DRV_COMPAT linkedsemi_hwmon
 
-LOG_MODULE_REGISTER(hwmon_i2c, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(hwmon_genernal, LOG_LEVEL_INF);
 
 /* ---- sensor sub-type (class 5 only) ---- */
 enum hwmon_sensor_type {
@@ -64,6 +64,14 @@ enum hwmon_sensor_type {
 	HWMON_TYPE_TEMP,
 	HWMON_TYPE_PSU,
 	HWMON_TYPE_INTRUSION,
+	/* PECI CPU temperature + power (IntelCPUSensor). The Intel CPU is
+	 * on a PECI bus, not I2C, but the same hwmon sysfs interface is
+	 * used as a transport: DTS / Margin / DIMM A1 / DIMM B1 come
+	 * through tempN_input + *_label, and Package / DRAM power through
+	 * powerN_input + *_label. The `name` file reports "peci_cputemp"
+	 * (the same string the upstream Linux xeon-pci-sensors driver
+	 * emits) so IntelCPUSensorMain can pick this node up unchanged. */
+	HWMON_TYPE_PECI_CPUTEMP,
 	/* NVMe is intentionally NOT a hwmon type: in native OpenBMC the NVMe
 	 * drive temperature is read via NVMe-MI by the dedicated NVMeSensor
 	 * daemon, not through hwmon tempX_input files. */
@@ -225,6 +233,9 @@ static enum hwmon_sensor_type hwmon_type_from_str(const char *s)
 	if (!strcmp(s, "intrusion")) {
 		return HWMON_TYPE_INTRUSION;
 	}
+	if (!strcmp(s, "peci_cputemp")) {
+		return HWMON_TYPE_PECI_CPUTEMP;
+	}
 	return HWMON_TYPE_NONE;
 }
 
@@ -238,6 +249,8 @@ static const char *hwmon_name_for_type(enum hwmon_sensor_type t)
 		return "pmbus";
 	case HWMON_TYPE_INTRUSION:
 		return "intrusion";
+	case HWMON_TYPE_PECI_CPUTEMP:
+		return "peci_cputemp";
 	default:
 		return "hwmon";
 	}
