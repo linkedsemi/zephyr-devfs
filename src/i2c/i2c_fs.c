@@ -181,6 +181,28 @@ static int i2cdev_close(struct fs_file_t *zfp)
     return 0;
 }
 
+void i2c_fs_force_release(void)
+{
+	for (int i = 0; i < I2C_NUM; i++)
+	{
+		if (atomic_get(&i2c_devices[i].is_open) != 0)
+		{
+			LOG_WRN("i2c_fs: force-releasing stuck open on '%s'",
+				i2c_devices[i].label ? i2c_devices[i].label : "?");
+			/*
+			 * Close any fd still pointing at this i2c_device. The
+			 * underlying fdtable entry is otherwise leaked when a
+			 * command aborts via longjmp/exit() and skips its own
+			 * close(), eventually exhausting the fd pool (-ENFILE).
+			 */
+			zvfs_close_fds_with_filep(&i2c_devices[i]);
+			atomic_clear(&i2c_devices[i].is_open);
+			i2c_devices[i].addr = 0;
+			i2c_devices[i].flags = 0;
+		}
+	}
+}
+
 static int i2cdev_lseek(struct fs_file_t *filp, off_t off, int whence)
 {
     LOG_ERR("lseek is not supported for I2C device");
