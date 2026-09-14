@@ -14,6 +14,19 @@
 
 LOG_MODULE_REGISTER(hwmon_adc, LOG_LEVEL_INF);
 
+/*
+ * Number of ADC channels converted by one regular sequence (LSQSH ADC fills
+ * REG_DAT00..REG_DAT12, 13 channels). The sequence buffer holds one result per
+ * configured channel, in configuration order, so the size of the read buffer
+ * must be the number of channels converted by one sequence. Keep this in sync
+ * with `nbr_of_conversion` of the ADC node.
+ */
+#define HWMON_ADC_CHANNEL_NUM       16
+
+/* The ADC driver numbers the channels of every device separately, so keep one
+ * rank counter per ADC device (LSQSH has adc1/adc2). */
+#define HWMON_ADC_DEV_MAX           2
+
 #define _HWMON_CLASS_2                  1
 #define HWMON_CLASS_TO_FLAG_RAW(x)      _HWMON_CLASS_##x
 #define HWMON_CLASS_TO_FLAG(x)          HWMON_CLASS_TO_FLAG_RAW(x)
@@ -25,6 +38,7 @@ struct hwmon_adc
     int ppos;
     struct k_poll_signal poll_signal;
     uint8_t channel;
+    uint8_t rank;       /* position of the channel in the ADC sequence */
     uint8_t inited;
 };
 
@@ -74,6 +88,37 @@ static struct hwmon_dev hwmon_devices[] = {
     DT_INST_FOREACH_STATUS_OKAY(HWMON_DEVICE_ENTRY)
 };
 
+/*
+ * The ADC regular sequence stores one result per configured channel, in the
+ * order the channels are set up on that device, so the rank of a channel is
+ * the number of channels already set up on the same ADC device.
+ */
+static const struct device *hwmon_adc_rank_dev[HWMON_ADC_DEV_MAX];
+static uint8_t hwmon_adc_rank_cnt[HWMON_ADC_DEV_MAX];
+static size_t hwmon_adc_rank_num = 0;
+
+static uint8_t hwmon_adc_next_rank(const struct device *adc_dev)
+{
+    size_t i = 0;
+
+    for (i = 0; i < hwmon_adc_rank_num; i++)
+    {
+        if (hwmon_adc_rank_dev[i] == adc_dev)
+            break;
+    }
+
+    if (i == hwmon_adc_rank_num)
+    {
+        __ASSERT(i < HWMON_ADC_DEV_MAX, "too many ADC devices");
+
+        hwmon_adc_rank_dev[i] = adc_dev;
+        hwmon_adc_rank_cnt[i] = 0;
+        hwmon_adc_rank_num++;
+    }
+
+    return hwmon_adc_rank_cnt[i]++;
+}
+
 static int adc_attr_open(sysfs_attr_t attr)
 {
     struct hwmon_adc *adc = attr->user_data;
@@ -81,18 +126,6 @@ static int adc_attr_open(sysfs_attr_t attr)
 
     if (!adc->inited)
     {
-        struct adc_channel_cfg channel_config = {
-            .channel_id = adc->channel,
-            .reference = ADC_REF_INTERNAL,
-            .acquisition_time = ADC_SAMPLETIME_15CYCLES,
-        };
-        int ret = adc_channel_setup(adc->dev, &channel_config);
-        if (ret != 0)
-        {
-            LOG_ERR("%s channel (%d) setup fail.", adc->dev->name, adc->channel);
-            return ret;
-        }
-
         k_poll_signal_init(&adc->poll_signal);
 
         adc->inited = 1;
@@ -104,25 +137,38 @@ static int adc_attr_open(sysfs_attr_t attr)
 static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
     struct hwmon_adc *adc = attr->user_data;
+    uint16_t values[HWMON_ADC_CHANNEL_NUM] = { 0 };
     uint16_t value;
     int ret;
 
     if (adc->ppos > 0)
         return 0;
 
+    if (adc->rank >= HWMON_ADC_CHANNEL_NUM)
+    {
+        LOG_ERR("%s channel (%d) rank (%d) out of range.",
+                adc->dev->name, adc->channel, adc->rank);
+        return -EINVAL;
+    }
+
+    /* The channels were configured at driver load time: one read converts the
+     * whole sequence, the wanted channel is picked by the position it was set
+     * up in. */
     struct adc_sequence sequence = {
-        .buffer = &value,
-        .buffer_size = sizeof(value),
-        .channels = BIT(adc->channel),
+        .buffer = values,
+        .buffer_size = sizeof(values),
+        .channels = adc->channel,
         // .resolution = 12,
     };
 
     ret = adc_read(adc->dev, &sequence);
     if (ret)
     {
-        LOG_ERR("%s channel (%d) read fail.", adc->dev->name, adc->channel);
+        LOG_ERR("%s channel (%d) read fail: %d.", adc->dev->name, adc->channel, ret);
         return ret;
     }
+
+    value = values[adc->rank];
 
     LOG_DBG("%s channel (%d) value: %u.", adc->dev->name, adc->channel, value);
 
@@ -341,6 +387,25 @@ static int hwmon_fs_init(void)
             attr->ops = &adc_attr_ops;
 
             sysfs_add_attribute(dev->node, attr);
+
+            /* The ADC driver is loaded at this point, configure the channel
+             * here once so that a read only has to trigger the sequence. */
+            struct adc_channel_cfg channel_config = {
+                .channel_id = dev->adc_dev[j].channel,
+                .reference = ADC_REF_VDD_1,
+                .acquisition_time = ADC_SAMPLETIME_15CYCLES,
+            };
+
+            if (adc_channel_setup(dev->adc_dev[j].dev, &channel_config) != 0)
+            {
+                LOG_ERR("%s channel (%d) setup fail.",
+                        dev->adc_dev[j].dev->name, dev->adc_dev[j].channel);
+                continue;
+            }
+
+            /* Remember where this channel's value lands in the sequence
+             * buffer: the results are stored in setup order per device. */
+            dev->adc_dev[j].rank = hwmon_adc_next_rank(dev->adc_dev[j].dev);
         }
 
         snprintf(dev->name_attr.name,
