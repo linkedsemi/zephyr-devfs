@@ -13,7 +13,6 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/atomic.h>
 #include <zephyr/posix/fcntl.h>
 #include <zephyr/sys/fdtable.h>
 #include <zephyr/drivers/i2c.h>
@@ -46,7 +45,6 @@ BUILD_ASSERT(I2C_NUM <= MAX_I2C_DEVICES,
         .dev = DEVICE_DT_GET(DT_INST(inst, DT_DRV_COMPAT)), \
         .label = DT_INST_PROP(inst, label),                 \
         .addr = 0,                                          \
-        .is_open = ATOMIC_INIT(0),                          \
         .flags = 0},
 
 static struct i2c_device i2c_devices[] = {
@@ -78,16 +76,32 @@ static int i2cdev_open(struct fs_file_t *zfp, const char *name, fs_mode_t flags)
     }
 
     // Ensure single open
-    if (atomic_set(&i2c->is_open, 1) != 0)
+    k_spinlock_key_t key = k_spin_lock(&i2c->lock);
+
+    if (i2c->owner != NULL)
     {
-        LOG_ERR("I2C device %s is already open", name);
+        uint32_t unclosed = i2c->open_seq - i2c->close_seq;
+
+        k_spin_unlock(&i2c->lock, key);
+        /* Say WHICH failure this is. "Busy" alone is useless to a caller that
+         * serializes its own i2c usage: it cannot tell a live holder from its
+         * own fd lost by an earlier command. opens-minus-closes climbing
+         * across commands is the signature of a leak, and this filesystem has
+         * no timeout that could paper over it. */
+        LOG_ERR("I2C device %s is already open (held by %p, %u open(s) with no "
+                "matching close) -- if no other command is running, a previous "
+                "tool leaked its fd",
+                name, (void *)i2c->owner, unclosed);
         return -EBUSY;
     }
 
     // Reset device state on open
     i2c->addr = 0;
     i2c->flags = 0;
+    i2c->owner = zfp;
+    i2c->open_seq++;
     zfp->filep = i2c;
+    k_spin_unlock(&i2c->lock, key);
 
     LOG_DBG("I2C device %s opened successfully", name);
     return 0;
@@ -169,13 +183,27 @@ static int i2cdev_close(struct fs_file_t *zfp)
 
     struct i2c_device *i2c = zfp->filep;
 
+    k_spinlock_key_t key = k_spin_lock(&i2c->lock);
+
+    if (i2c->owner != zfp)
+    {
+        /* The bus belongs to somebody else. Release it anyway: this close is
+         * most likely a stale handle being closed twice, and refusing would
+         * leak the very fd the caller is trying to get rid of while wedging the
+         * bus for good. Just make the bug visible. */
+        LOG_ERR("close on I2C device %s from a non-owner file object (%p, owner "
+                "%p) -- stale double close, releasing anyway",
+                i2c->label, (void *)zfp, (void *)i2c->owner);
+    }
+
     // Reset per-open state
     i2c->addr = 0;
     i2c->flags = 0;
 
-    atomic_clear(&i2c->is_open);
-
+    i2c->owner = NULL;
+    i2c->close_seq++;
     zfp->filep = NULL;
+    k_spin_unlock(&i2c->lock, key);
 
     LOG_DBG("I2C device closed");
     return 0;
