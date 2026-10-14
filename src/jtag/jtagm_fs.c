@@ -210,7 +210,9 @@ static int jtagm_ioctl(struct fs_file_t *zfp, unsigned long cmd, va_list args)
         }
         break;
     case JTAG_SIOCTRST:
-        LOG_DBG("set trst");
+        uint8_t *value = va_arg(args, uint8_t *);
+        LOG_DBG("set trst %d", *value);
+        ret = jtag_sw_xfer(jtag->dev, JTAG_TRST, *value);
         break;
     default:
         return -EINVAL;

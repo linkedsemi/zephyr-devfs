@@ -233,4 +233,22 @@ static int jtag_fs_read_idcode(const struct shell *sh, size_t argc, char **argv)
     return 0;
 }
 SHELL_CMD_REGISTER(jtag_fs_read_idcode, NULL, "jtag_fs_read_idcode", jtag_fs_read_idcode);
- 
+
+static int jtag_trst_test(const struct shell *sh, size_t argc, char **argv)
+{
+    uint8_t active = 1;
+    int fd = open("/dev/jtag1", O_RDWR);
+
+    if (fd) {
+        ioctl(fd, JTAG_SIOCTRST, &active);
+        k_msleep(1);
+
+        active = 0;
+        ioctl(fd, JTAG_SIOCTRST, &active);
+
+        close(fd);
+    }
+
+    return 0;
+}
+SHELL_CMD_REGISTER(jtag_trst_test, NULL, "jtag_trst_test", jtag_trst_test);
