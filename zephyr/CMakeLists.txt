@@ -3,7 +3,7 @@ if(CONFIG_ZEPHYR_DEVFS_DRIVER)
 
 if(CONFIG_SOC_LSQSH_CPU1)
     zephyr_library_sources(
-        # ${ZEPHYR_CURRENT_MODULE_DIR}/src/gpio/gpio_fs.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/gpio/gpio_fs.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/gpio/gpio_testcase.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/jtag/jtagm_fs.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/jtag/jtagm_testcase.c

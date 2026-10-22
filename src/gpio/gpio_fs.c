@@ -5,6 +5,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/spinlock.h>
 #include <zephyr/posix/fcntl.h>
 #include <zephyr/sys/fdtable.h>
 #include <zephyr/fs/devfs.h>
@@ -21,6 +22,10 @@ LOG_MODULE_REGISTER(gpio_fs, LOG_LEVEL_ERR);
 #define GPIO_LINE_EVENT_MAX                     (64)
 
 #define GPIO_LINE_EVENT_DATA_MAX                (16)
+
+#ifndef FIONBIO
+#define FIONBIO                                 0x5421
+#endif
 
 #define GPIOHANDLE_REQUEST_VALID_FLAGS \
                                     (GPIOHANDLE_REQUEST_INPUT | \
@@ -57,12 +62,13 @@ struct gpio_event
     struct gpio_callback gpio_cb;
     struct k_poll_signal signal;
     struct ring_buf rb;
+    struct k_spinlock rb_lock;
     struct gpioevent_data rb_buf[GPIO_LINE_EVENT_DATA_MAX];
     char name[8];
 };
 
 #define INIT_GPIO_LINE_NAMES_ARRAY(inst)                                       \
-    static const char* gpio_line_names_##inst[] =                              \
+    static const char* gpio_line_names_##inst[DT_INST_PROP(inst, ngpios)] =    \
         DT_INST_PROP_OR(inst, gpio_line_names, {NULL});
 
 DT_INST_FOREACH_STATUS_OKAY(INIT_GPIO_LINE_NAMES_ARRAY)
@@ -302,6 +308,11 @@ static int gpio_line_ioctl(struct fs_file_t* zfp, unsigned long request, va_list
             gpio_unlock();
         }
         break;
+    case FIONBIO:
+    case F_SETFL:
+        return 0;
+    case F_GETFL:
+        return O_RDWR;
     default:
         LOG_ERR("Unsupported line ioctl request: %lu", request);
         return -ENOTTY;
@@ -437,11 +448,21 @@ static void gpio_irq(const struct device *dev, struct gpio_callback *cb, uint32_
             event_data.id = GPIOEVENT_EVENT_FALLING_EDGE;
         }
 
+        k_spinlock_key_t key = k_spin_lock(&event->rb_lock);
         uint32_t w_size = ring_buf_put(&event->rb, (void *)&event_data, sizeof(event_data));
+
         if (w_size != sizeof(event_data))
-            __ASSERT(0, "chip: %s, pin: %d, buffer full!!", event->chip->label, pin);
+        {
+            /* Keep the newest edge event instead of terminating the GPIO
+             * interrupt path when the userspace consumer is not scheduled yet. */
+            uint8_t discard[sizeof(struct gpioevent_data)];
+
+            ring_buf_get(&event->rb, discard, sizeof(discard));
+            ring_buf_put(&event->rb, (void *)&event_data, sizeof(event_data));
+        }
 
         k_poll_signal_raise(&event->signal, 1);
+        k_spin_unlock(&event->rb_lock, key);
     }
 }
 
@@ -520,7 +541,36 @@ static int gpio_event_close(struct fs_file_t* zfp)
 static ssize_t gpio_event_read(struct fs_file_t *filp, void *dest, size_t nbytes)
 {
     struct gpio_event *event = filp->filep;
-    return ring_buf_get(&event->rb, dest, nbytes);
+    const size_t event_size = sizeof(struct gpioevent_data);
+    size_t read_size;
+    uint32_t available;
+    uint32_t read;
+    k_spinlock_key_t key;
+
+    if (nbytes < event_size)
+        return -EINVAL;
+
+    read_size = MIN(nbytes, sizeof(event->rb_buf));
+    read_size -= read_size % event_size;
+
+    key = k_spin_lock(&event->rb_lock);
+    available = ring_buf_size_get(&event->rb);
+    read_size = MIN(read_size, available);
+    read_size -= read_size % event_size;
+
+    if (read_size == 0)
+    {
+        k_poll_signal_reset(&event->signal);
+        k_spin_unlock(&event->rb_lock, key);
+        return -EAGAIN;
+    }
+
+    read = ring_buf_get(&event->rb, dest, read_size);
+    if (ring_buf_size_get(&event->rb) < event_size)
+        k_poll_signal_reset(&event->signal);
+    k_spin_unlock(&event->rb_lock, key);
+
+    return read;
 }
 
 static int gpio_event_ioctl(struct fs_file_t* zfp, unsigned long request, va_list args)
@@ -563,9 +613,11 @@ static int gpio_event_ioctl(struct fs_file_t* zfp, unsigned long request, va_lis
         struct zvfs_pollfd* pfd = va_arg(args, struct zvfs_pollfd*);
         struct k_poll_event** pev = va_arg(args, struct k_poll_event**);
         struct gpio_event *event = zfp->filep;
+        k_spinlock_key_t key;
 
         if (pfd->events & ZVFS_POLLIN)
         {
+            key = k_spin_lock(&event->rb_lock);
             size_t buf_used = ring_buf_size_get(&event->rb);
             if (buf_used >= sizeof(struct gpioevent_data))
             {
@@ -573,10 +625,16 @@ static int gpio_event_ioctl(struct fs_file_t* zfp, unsigned long request, va_lis
                 k_poll_signal_reset(&event->signal);
                 (*pev)->state = K_POLL_STATE_NOT_READY;
             }
+            k_spin_unlock(&event->rb_lock, key);
             (*pev)++;
         }
     }
     break;
+    case FIONBIO:
+    case F_SETFL:
+        return 0;
+    case F_GETFL:
+        return O_RDWR;
     default:
         LOG_ERR("Unsupported event ioctl request: %lu", request);
         return -ENOTTY;
