@@ -33,11 +33,15 @@ struct fan_pwm_tach
     struct sysfs_attribute fan_attr;
     struct sysfs_attribute pwm_attr;
     struct sysfs_attribute pwm_en_attr;
-    int fan_ppos;
-    int pwm_ppos;
-    int pwm_en_ppos;
     struct k_poll_signal poll_signal;
     uint8_t inited;
+    /* Sysfs ops only see the attribute, not the open file, so "value already
+     * handed out" has to live on the attribute. Re-armed by open() and, for
+     * fanN_input, by poll_prepare(): poll driven readers get one value per
+     * poll cycle, plain fs readers (`fs cat`) see value + EOF. */
+    uint8_t read_done;      /* fanN_input */
+    uint8_t pwm_done;       /* pwmN */
+    uint8_t pwm_en_done;    /* pwmN_enable */
 };
 
 struct hwmon_fan_dev
@@ -46,7 +50,7 @@ struct hwmon_fan_dev
     struct fan_pwm_tach *fan_dev;
     struct sysfs_node *node;
     struct sysfs_attribute name_attr;
-    int ppos;
+    uint8_t name_done;  /* read cursor of the name file */
 };
 
 #define FAN_PWM_TACH_DEFINE(inst)                                              \
@@ -85,7 +89,8 @@ static struct hwmon_fan_dev hwmon_fan_devices[] = {
 static int fan_attr_open(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->fan_ppos = 0;
+    /* A fresh descriptor starts at offset 0: re-arm the one-shot value. */
+    fan->read_done = 0;
     if (!fan->inited)
     {
         k_poll_signal_init(&fan->poll_signal);
@@ -101,7 +106,8 @@ static ssize_t fan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
     int len;
     int ret;
 
-    if (fan->fan_ppos > 0)
+    /* Value already handed out on this open/poll cycle -> EOF. */
+    if (fan->read_done)
         return 0;
 
     /* Read RPM from cap sensor via sensor_sample_fetch_chan/sensor_channel_get */
@@ -125,11 +131,12 @@ static ssize_t fan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
     uint32_t rpm = (uint32_t)((uint64_t)val.val1 * 60 / 2);
 
     len = snprintf(buf, size, "%u\n", rpm);
+
     if (len > 0)
     {
-        fan->fan_ppos = len;
-        k_poll_signal_reset(&fan->poll_signal);
+        fan->read_done = 1;
     }
+    k_poll_signal_reset(&fan->poll_signal);
 
     return len;
 }
@@ -137,7 +144,6 @@ static ssize_t fan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 static int fan_attr_close(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->fan_ppos = 0;
     k_poll_signal_reset(&fan->poll_signal);
     LOG_DBG("fan_input closed.");
     return 0;
@@ -148,7 +154,7 @@ static int fan_attr_close(sysfs_attr_t attr)
 static int pwm_attr_open(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->pwm_ppos = 0;
+    fan->pwm_done = 0;
     LOG_DBG("pwm opened. pwm_ch=%d", fan->pwm_channel);
     return 0;
 }
@@ -157,13 +163,15 @@ static ssize_t pwm_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
     struct fan_pwm_tach *fan = attr->user_data;
     int len;
-    if (fan->pwm_ppos > 0)
+
+    if (fan->pwm_done)
         return 0;
+
     /* Read back the stored PWM value (0-255) */
     len = snprintf(buf, size, "%u\n", fan->pwm_value);
     if (len > 0)
     {
-        fan->pwm_ppos = len;
+        fan->pwm_done = 1;
     }
     return len;
 }
@@ -207,13 +215,18 @@ static ssize_t pwm_attr_write(sysfs_attr_t attr, const void *buf, size_t size)
 static int pwm_attr_close(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->pwm_ppos = 0;
     LOG_DBG("pwm closed.");
     return 0;
 }
 
 /* --- ioctl / poll operations --- */
 
+/* fanN_input is generated on demand in fan_attr_read(), so a freshly opened
+ * descriptor is always readable: report POLLIN unconditionally. The read
+ * cursor is attribute wide and must not gate POLLIN here (one reader that had
+ * already consumed the value used to silence the others). Instead every poll
+ * re-arms it: a poll driven reader (boost::asio keeps its fd open forever)
+ * gets one value per poll cycle, while `fs cat` still ends on EOF. */
 static int fan_poll_prepare(struct fan_pwm_tach *fan,
                             struct zvfs_pollfd *pfd,
                             struct k_poll_event **pev,
@@ -230,8 +243,8 @@ static int fan_poll_prepare(struct fan_pwm_tach *fan,
         (*pev)->state = K_POLL_STATE_NOT_READY;
         (*pev)++;
 
-        if (fan->fan_ppos == 0)
-            k_poll_signal_raise(&fan->poll_signal, 0);
+        fan->read_done = 0;
+        k_poll_signal_raise(&fan->poll_signal, 0);
     }
     return 0;
 }
@@ -240,9 +253,11 @@ static int fan_poll_update(struct fan_pwm_tach *fan,
                            struct zvfs_pollfd *pfd,
                            struct k_poll_event **pev)
 {
+    (void)fan;
+
     if (pfd->events & ZVFS_POLLIN)
     {
-        if ((*pev)->state != K_POLL_STATE_NOT_READY && (fan->fan_ppos == 0))
+        if ((*pev)->state != K_POLL_STATE_NOT_READY)
             pfd->revents |= ZVFS_POLLIN;
         (*pev)++;
     }
@@ -334,7 +349,7 @@ static struct sysfs_attribute_ops pwm_attr_ops = {
 static ssize_t name_open(sysfs_attr_t attr)
 {
     struct hwmon_fan_dev *dev = attr->user_data;
-    dev->ppos = 0;
+    dev->name_done = 0;
     return 0;
 }
 
@@ -344,7 +359,7 @@ static ssize_t name_read(sysfs_attr_t attr, void *buf, size_t size)
     const char *name = "aspeed,ast2400-pwm-tacho";
     ssize_t len;
 
-    if (dev->ppos > 0)
+    if (dev->name_done)
         return 0;
 
     len = snprintf(buf, size, "%s\n", name);
@@ -357,14 +372,13 @@ static ssize_t name_read(sysfs_attr_t attr, void *buf, size_t size)
     if (len > size)
         len = size;
 
-    dev->ppos = len;
+    dev->name_done = 1;
     return len;
 }
 
 static ssize_t name_close(sysfs_attr_t attr)
 {
-    struct hwmon_fan_dev *dev = attr->user_data;
-    dev->ppos = 0;
+    ARG_UNUSED(attr);
     return 0;
 }
 
@@ -381,7 +395,7 @@ static struct sysfs_attribute_ops name_attr_ops = {
 static int pwm_en_attr_open(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->pwm_en_ppos = 0;
+    fan->pwm_en_done = 0;
     LOG_DBG("pwm enable opened. pwm_ch=%d", fan->pwm_channel);
     return 0;
 }
@@ -389,7 +403,6 @@ static int pwm_en_attr_open(sysfs_attr_t attr)
 static int pwm_en_attr_close(sysfs_attr_t attr)
 {
     struct fan_pwm_tach *fan = attr->user_data;
-    fan->pwm_en_ppos = 0;
     LOG_DBG("pwm enable closed.");
     return 0;
 }
@@ -398,13 +411,14 @@ static ssize_t pwm_en_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
     struct fan_pwm_tach *fan = attr->user_data;
     int len;
-    if (fan->pwm_en_ppos > 0)
+
+    if (fan->pwm_en_done)
         return 0;
 
     len = snprintf(buf, size, "%u\n", fan->pwm_enable);
     if (len > 0)
     {
-        fan->pwm_en_ppos = len;
+        fan->pwm_en_done = 1;
     }
     return len;
 }

@@ -35,11 +35,15 @@ struct hwmon_adc
 {
     const struct device *dev;
     struct sysfs_attribute attribute;
-    int ppos;
     struct k_poll_signal poll_signal;
     uint8_t channel;
     uint8_t rank;       /* position of the channel in the ADC sequence */
     uint8_t inited;
+    /* Sysfs ops only see the attribute, not the open file, so the "value
+     * already handed out" flag has to live here. It is re-armed by open() and
+     * by poll_prepare(): poll driven readers (dbus-sensors) get one value per
+     * poll cycle, plain fs readers (`fs cat`) see value + EOF and terminate. */
+    uint8_t read_done;
 };
 
 struct hwmon_dev
@@ -49,7 +53,7 @@ struct hwmon_dev
     size_t adc_dev_num;
     struct sysfs_node *node;
     struct sysfs_attribute name_attr;
-    int ppos;
+    uint8_t name_done;  /* read cursor of the name file */
 };
 
 #define HWMON_ADC_ENTRY(node_id, prop, idx)                               \
@@ -122,7 +126,9 @@ static uint8_t hwmon_adc_next_rank(const struct device *adc_dev)
 static int adc_attr_open(sysfs_attr_t attr)
 {
     struct hwmon_adc *adc = attr->user_data;
-    adc->ppos = 0;
+
+    /* A fresh descriptor starts at offset 0: re-arm the one-shot value. */
+    adc->read_done = 0;
 
     if (!adc->inited)
     {
@@ -141,8 +147,11 @@ static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
     uint16_t value;
     int ret;
 
-    if (adc->ppos > 0)
+    /* Value already handed out on this open/poll cycle -> EOF. */
+    if (adc->read_done)
+    {
         return 0;
+    }
 
     if (adc->rank >= HWMON_ADC_CHANNEL_NUM)
     {
@@ -173,11 +182,12 @@ static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
     LOG_DBG("%s channel (%d) value: %u.", adc->dev->name, adc->channel, value);
 
     int len = snprintf(buf, size, "%u\n", value);
+
     if (len > 0)
     {
-        adc->ppos = len;
-        k_poll_signal_reset(&adc->poll_signal);
+        adc->read_done = 1;
     }
+    k_poll_signal_reset(&adc->poll_signal);
 
     return len;
 }
@@ -185,7 +195,6 @@ static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 static int adc_attr_close(sysfs_attr_t attr)
 {
     struct hwmon_adc *adc = attr->user_data;
-    adc->ppos = 0;
     k_poll_signal_reset(&adc->poll_signal);
     LOG_DBG("%s channel (%d) closed.", adc->dev->name, adc->channel);
 
@@ -211,10 +220,14 @@ static int hwmon_poll_prepare_ctx(struct hwmon_adc *adc,
         (*pev)->state = K_POLL_STATE_NOT_READY;
         (*pev)++;
 
-        if (adc->ppos == 0)
-        {
-            k_poll_signal_raise(&adc->poll_signal, 0);
-        }
+        /* Contents are generated on read, so a fresh descriptor is always
+         * readable: report POLLIN unconditionally. The read cursor is
+         * attribute wide, so it must not gate POLLIN here -- but every poll
+         * re-arms it, which gives a poll driven reader (boost::asio keeps its
+         * fd open forever) one value per poll cycle while `fs cat` still ends
+         * on EOF. */
+        adc->read_done = 0;
+        k_poll_signal_raise(&adc->poll_signal, 0);
     }
 
     return 0;
@@ -224,9 +237,11 @@ static int hwmon_poll_update_ctx(struct hwmon_adc *adc,
                                  struct zvfs_pollfd *pfd,
                                  struct k_poll_event **pev)
 {
+    (void)adc;
+
     if (pfd->events & ZVFS_POLLIN)
     {
-        if ((*pev)->state != K_POLL_STATE_NOT_READY && (adc->ppos == 0))
+        if ((*pev)->state != K_POLL_STATE_NOT_READY)
         {
             pfd->revents |= ZVFS_POLLIN;
         }
@@ -301,7 +316,7 @@ static ssize_t name_open(sysfs_attr_t attr)
 {
     struct hwmon_dev *dev = attr->user_data;
     LOG_DBG("%s attribute (%s) opened.", dev->label, attr->name);
-    dev->ppos = 0;
+    dev->name_done = 0;
     return 0;
 }
 
@@ -311,7 +326,7 @@ static ssize_t name_read(sysfs_attr_t attr, void *buf, size_t size)
     const char *name = "iio_hwmon";
     ssize_t len;
 
-    if (dev->ppos > 0)
+    if (dev->name_done)
         return 0;
 
     len = snprintf(buf, size, "%s\n", name);
@@ -324,7 +339,7 @@ static ssize_t name_read(sysfs_attr_t attr, void *buf, size_t size)
     if (len > size)
         len = size;
 
-    dev->ppos = len;
+    dev->name_done = 1;
     return len;
 }
 
@@ -332,7 +347,6 @@ static ssize_t name_close(sysfs_attr_t attr)
 {
     struct hwmon_dev *dev = attr->user_data;
     LOG_DBG("%s attribute (%s) closed.", dev->label, attr->name);
-    dev->ppos = 0;
     return 0;
 }
 

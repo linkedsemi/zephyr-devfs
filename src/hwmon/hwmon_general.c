@@ -101,12 +101,17 @@ struct hwmon_i2c_client {
 	UTIL_AND(DT_INST_NODE_HAS_PROP(inst, sensor_type),               \
 		 DT_ON_BUS(DT_INST_PHANDLE_BY_IDX(inst, hwmon_ins, 0), i2c))
 
-/* ---- per-instance channel (runtime) ---- */
+/* ---- per-instance channel (runtime) ----
+ * Sysfs back-end ops only get the attribute, never the open file, so a
+ * "already read" flag can only live on the attribute itself. It is re-armed by
+ * open() and by poll_prepare() (see chan_poll_prepare): a reader of the fs API
+ * (shell `fs cat`) opens once and sees value + EOF, while a poll driven reader
+ * (dbus-sensors, boost::asio) re-arms on every poll and gets a fresh value. */
 struct hwmon_channel {
 	const char *filename;/* the "<chan><n>_input" file (label stripped) */
 	struct sysfs_attribute attr;
-	int ppos;
 	struct k_poll_signal poll_signal;/* for poll/async-read support (dbus-sensors) */
+	bool read_done;      /* value already handed out, next read is EOF */
 	struct hwmon_dev *dev;/* back pointer */
 
 	/* optional "<chan><n>_label" file: created only when the DT `meas`
@@ -115,8 +120,8 @@ struct hwmon_channel {
 	 * every rail falls back to the generic "output" property. */
 	const char *label;   /* label file content (e.g. "vout1"), or NULL */
 	struct sysfs_attribute label_attr;
-	int label_ppos;
 	bool has_label;
+	bool label_done;     /* per-file read cursor (see struct comment) */
 };
 
 struct hwmon_dev {
@@ -136,9 +141,9 @@ struct hwmon_dev {
 	struct sysfs_attribute bus_addr_attr;
 	struct sysfs_attribute label_attr;
 	struct sysfs_attribute rearm_attr;
-	int name_ppos;
-	int bus_ppos;
-	int label_ppos;
+	bool name_done;      /* per-file read cursors (see struct hwmon_channel) */
+	bool bus_done;
+	bool dev_label_done;
 };
 
 /* ---- device table ----
@@ -375,7 +380,8 @@ static void hwmon_dev_setup(struct hwmon_dev *dev)
 		int fn_len = colon ? (int)(colon - entry) : (int)strlen(entry);
 
 		ch->dev = dev;
-		ch->ppos = 0;
+		ch->read_done = false;
+		ch->label_done = false;
 		k_poll_signal_init(&ch->poll_signal);
 
 		/* value file: copy just the "<chan><n>_input" part (before ':') */
@@ -389,7 +395,6 @@ static void hwmon_dev_setup(struct hwmon_dev *dev)
 		 * content = the DT-supplied text after ':'. */
 		ch->has_label = false;
 		ch->label = NULL;
-		ch->label_ppos = 0;
 		if (colon && colon[1] != '\0') {
 			snprintf(ch->label_attr.name, SYSFS_ATTRIBUTE_NAME_MAX,
 				 "%s", ch->filename);
@@ -412,19 +417,20 @@ static int chan_attr_open(sysfs_attr_t attr)
 {
 	struct hwmon_channel *ch = attr->user_data;
 
-	ch->ppos = 0;
+	/* A fresh descriptor starts at offset 0: re-arm the one-shot value. */
+	ch->read_done = false;
 	return 0;
 }
 
 static ssize_t chan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
 	struct hwmon_channel *ch = attr->user_data;
+	struct hwmon_dev *dev = ch->dev;
 
-	if (ch->ppos > 0) {
+	/* Value already handed out on this open/poll cycle -> EOF. */
+	if (ch->read_done) {
 		return 0;
 	}
-
-	struct hwmon_dev *dev = ch->dev;
 
 	int ret = hwmon_ensure_fresh(dev);
 	if (ret < 0) {
@@ -455,31 +461,38 @@ static ssize_t chan_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 		return -EIO;
 	}
 
-	/* driver returns the value already in the hwmon ABI unit (val1) */
+	/* driver returns the value already in the hwmon ABI unit (val1). */
 	int len = snprintf(buf, size, "%d\n", val.val1);
 
 	if (len > 0) {
-		ch->ppos = len;
+		ch->read_done = true;
 	}
+
 	return len;
 }
 
 static int chan_attr_close(sysfs_attr_t attr)
 {
-	struct hwmon_channel *ch = attr->user_data;
+	ARG_UNUSED(attr);
 
-	ch->ppos = 0;
 	return 0;
 }
 
 /* ---- poll/async-read support ----
- * dbus-sensors (HwmonTempSensor) reads tempN_input via boost::asio
+ * dbus-sensors (HwmonTempSensor) used to read tempN_input via boost::asio
  * async_read_some, which needs fcntl (F_GETFL/F_SETFL) + poll
  * (ZFD_IOCTL_POLL_*). Without an ioctl handler the async read fails ->
- * Value=nan. The value is produced on demand in chan_attr_read, so the fd
- * is readable whenever ppos == 0. Mirror hwmon_adc.c: raise a k_poll_signal
- * in POLL_PREPARE when ppos == 0. With HwmonTempSensor reopening the fd
- * each poll, ppos is 0 every cycle -> always readable. */
+ * Value=nan.
+ *
+ * Attribute contents are generated on demand in chan_attr_read(), so a freshly
+ * opened descriptor is always readable: report POLLIN unconditionally. The
+ * read cursor is deliberately NOT consulted here -- it is attribute wide, so
+ * gating POLLIN on it used to silence one reader because another had already
+ * consumed the value.
+ *
+ * Every poll() call re-arms the cursor instead: a poll driven reader
+ * (boost::asio keeps its fd open forever) gets one value per poll cycle, while
+ * a plain fs reader that never polls (`fs cat`) still terminates on EOF. */
 static int chan_poll_prepare(struct hwmon_channel *ch,
 			     struct zvfs_pollfd *pfd,
 			     struct k_poll_event **pev,
@@ -494,9 +507,8 @@ static int chan_poll_prepare(struct hwmon_channel *ch,
 		(*pev)->mode = K_POLL_MODE_NOTIFY_ONLY;
 		(*pev)->state = K_POLL_STATE_NOT_READY;
 		(*pev)++;
-		if (ch->ppos == 0) {
-			k_poll_signal_raise(&ch->poll_signal, 0);
-		}
+		ch->read_done = false;
+		k_poll_signal_raise(&ch->poll_signal, 0);
 	}
 	return 0;
 }
@@ -505,8 +517,10 @@ static int chan_poll_update(struct hwmon_channel *ch,
 			    struct zvfs_pollfd *pfd,
 			    struct k_poll_event **pev)
 {
+	(void)ch;
+
 	if (pfd->events & ZVFS_POLLIN) {
-		if ((*pev)->state != K_POLL_STATE_NOT_READY && (ch->ppos == 0)) {
+		if ((*pev)->state != K_POLL_STATE_NOT_READY) {
 			pfd->revents |= ZVFS_POLLIN;
 		}
 		(*pev)++;
@@ -572,7 +586,7 @@ static int label_attr_open(sysfs_attr_t attr)
 {
 	struct hwmon_channel *ch = attr->user_data;
 
-	ch->label_ppos = 0;
+	ch->label_done = false;
 	return 0;
 }
 
@@ -580,23 +594,22 @@ static ssize_t label_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
 	struct hwmon_channel *ch = attr->user_data;
 
-	if (ch->label_ppos > 0) {
+	if (ch->label_done) {
 		return 0;
 	}
 
 	int len = snprintf(buf, size, "%s\n", ch->label);
 
 	if (len > 0) {
-		ch->label_ppos = len;
+		ch->label_done = true;
 	}
 	return len;
 }
 
 static int label_attr_close(sysfs_attr_t attr)
 {
-	struct hwmon_channel *ch = attr->user_data;
+	ARG_UNUSED(attr);
 
-	ch->label_ppos = 0;
 	return 0;
 }
 
@@ -614,7 +627,7 @@ static int dev_label_attr_open(sysfs_attr_t attr)
 {
 	struct hwmon_dev *dev = attr->user_data;
 
-	dev->label_ppos = 0;
+	dev->dev_label_done = false;
 	return 0;
 }
 
@@ -622,23 +635,22 @@ static ssize_t dev_label_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
 	struct hwmon_dev *dev = attr->user_data;
 
-	if (dev->label_ppos > 0) {
+	if (dev->dev_label_done) {
 		return 0;
 	}
 
 	int len = snprintf(buf, size, "%s\n", dev->label);
 
 	if (len > 0) {
-		dev->label_ppos = len;
+		dev->dev_label_done = true;
 	}
 	return len;
 }
 
 static int dev_label_attr_close(sysfs_attr_t attr)
 {
-	struct hwmon_dev *dev = attr->user_data;
+	ARG_UNUSED(attr);
 
-	dev->label_ppos = 0;
 	return 0;
 }
 
@@ -654,7 +666,7 @@ static int name_attr_open(sysfs_attr_t attr)
 {
 	struct hwmon_dev *dev = attr->user_data;
 
-	dev->name_ppos = 0;
+	dev->name_done = false;
 	return 0;
 }
 
@@ -662,23 +674,22 @@ static ssize_t name_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
 	struct hwmon_dev *dev = attr->user_data;
 
-	if (dev->name_ppos > 0) {
+	if (dev->name_done) {
 		return 0;
 	}
 
 	int len = snprintf(buf, size, "%s\n", dev->name_str);
 
 	if (len > 0) {
-		dev->name_ppos = len;
+		dev->name_done = true;
 	}
 	return len;
 }
 
 static int name_attr_close(sysfs_attr_t attr)
 {
-	struct hwmon_dev *dev = attr->user_data;
+	ARG_UNUSED(attr);
 
-	dev->name_ppos = 0;
 	return 0;
 }
 
@@ -694,32 +705,32 @@ static int bus_addr_open(sysfs_attr_t attr)
 {
 	struct hwmon_dev *dev = attr->user_data;
 
-	dev->bus_ppos = 0;
+	dev->bus_done = false;
 	return 0;
 }
 
 static ssize_t bus_addr_read(sysfs_attr_t attr, void *buf, size_t size)
 {
 	struct hwmon_dev *dev = attr->user_data;
+	int bus = hwmon_i2c_bus_num(dev->client.bus);
+	int len;
 
-	if (dev->bus_ppos > 0) {
+	if (dev->bus_done) {
 		return 0;
 	}
 
-	int bus = hwmon_i2c_bus_num(dev->client.bus);
-	int len = snprintf(buf, size, "%u-%04x\n", bus, dev->client.addr);
+	len = snprintf(buf, size, "%u-%04x\n", bus, dev->client.addr);
 
 	if (len > 0) {
-		dev->bus_ppos = len;
+		dev->bus_done = true;
 	}
 	return len;
 }
 
 static int bus_addr_close(sysfs_attr_t attr)
 {
-	struct hwmon_dev *dev = attr->user_data;
+	ARG_UNUSED(attr);
 
-	dev->bus_ppos = 0;
 	return 0;
 }
 
