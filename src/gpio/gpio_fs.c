@@ -42,6 +42,7 @@ struct gpio_chip
 {
     const struct device* dev;
     const char *label;
+    char default_label[24];
     const char **line_names;
     const uint32_t pin_count;
     uint32_t pin_mask;
@@ -76,7 +77,7 @@ DT_INST_FOREACH_STATUS_OKAY(INIT_GPIO_LINE_NAMES_ARRAY)
 #define GPIO_DEVICE_PROCESS(inst)                                               \
     {                                                                           \
         .dev =  DEVICE_DT_GET(DT_INST(inst, DT_DRV_COMPAT)),                    \
-        .label = DT_INST_PROP(inst, label),                                     \
+        .label = DT_INST_PROP_OR(inst, label, NULL),                            \
         .line_names = gpio_line_names_##inst,                                   \
         .pin_count = DT_INST_PROP(inst, ngpios),                                \
         .pin_mask = 0,                                                          \
@@ -100,9 +101,23 @@ static inline void gpio_unlock()
     k_mutex_unlock(&lock);
 }
 
+static bool gpio_label_in_use(const char *label)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(gpio_devices); i++)
+    {
+        if (gpio_devices[i].label != NULL &&
+            strcmp(label, gpio_devices[i].label) == 0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static struct gpio_chip *gpio_chip_find(const char *name)
 {
-    for (int i = 0; i < ARRAY_SIZE(gpio_devices); i++)
+    for (size_t i = 0; i < ARRAY_SIZE(gpio_devices); i++)
     {
         if (strcmp(name, gpio_devices[i].label) == 0)
             return &gpio_devices[i];
@@ -818,7 +833,28 @@ int gpio_fs_init(void)
 {
     char name[32];
 
-    for (int i = 0; i < ARRAY_SIZE(gpio_devices); i++)
+    /* Keep explicit devicetree labels and allocate free names to the others. */
+    for (size_t i = 0; i < ARRAY_SIZE(gpio_devices); i++)
+    {
+        if (gpio_devices[i].label != NULL)
+        {
+            continue;
+        }
+
+        for (int index = 0;; index++)
+        {
+            snprintf(gpio_devices[i].default_label,
+                     sizeof(gpio_devices[i].default_label), "gpiochip%d",
+                     index);
+            if (!gpio_label_in_use(gpio_devices[i].default_label))
+            {
+                gpio_devices[i].label = gpio_devices[i].default_label;
+                break;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(gpio_devices); i++)
     {
         snprintf(name, sizeof(name) - 1, "/dev/%s", gpio_devices[i].label);
         devfs_register(name, &gpio_chip);
