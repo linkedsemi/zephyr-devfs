@@ -11,5 +11,12 @@ config I2C_DEV_LOG_LEVEL
     help
         Log level for i2c_dev module
 
+config ZEPHYR_DEVFS_RANDOM_TEST
+	default n
+	bool "enable /dev/urandom devfs test command"
+	help
+	  Build the random_fs_test shell command. It exercises multiple opens,
+	  fcntl status flags, poll, read sizes, burst reads, and concurrent
+	  readers against /dev/urandom.
+
 endif # ZEPHYR_DEVFS_DRIVER
- 

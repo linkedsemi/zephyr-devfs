@@ -16,9 +16,14 @@ if(CONFIG_SOC_LSQSH_CPU1)
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/hwmon/hwmon_pwm_tach.c
         ${ZEPHYR_CURRENT_MODULE_DIR}/src/i2c/i2c_fs.c
         # ${ZEPHYR_CURRENT_MODULE_DIR}/src/i2c/i2c_testcase.c
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/random/random_fs.c
     )
 
     zephyr_library_include_directories(${ZEPHYR_CURRENT_MODULE_DIR}/inc)
+    zephyr_library_sources_ifdef(
+        CONFIG_ZEPHYR_DEVFS_RANDOM_TEST
+        ${ZEPHYR_CURRENT_MODULE_DIR}/src/random/random_testcase.c
+    )
 
 endif()
 
