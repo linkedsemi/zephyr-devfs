@@ -53,7 +53,9 @@ struct hwmon_dev
     size_t adc_dev_num;
     struct sysfs_node *node;
     struct sysfs_attribute name_attr;
-    uint8_t name_done;  /* read cursor of the name file */
+    struct sysfs_attribute label_attr; /* device-level "label" (DT label) */
+    uint8_t name_done;      /* read cursor of the name file */
+    uint8_t dev_label_done; /* read cursor of the label file */
 };
 
 #define HWMON_ADC_ENTRY(node_id, prop, idx)                               \
@@ -358,6 +360,55 @@ static struct sysfs_attribute_ops name_attr_ops = {
     .ioctl = NULL
 };
 
+/* ---- device label attribute ----
+ * A device-level "label" file holding the DT label (e.g. "hwmon0"). Linux
+ * hwmon has no such file, but OpenBMC consumers look it up to identify an
+ * hwmon node by its configured label -- dbus-sensors' ChassisIntrusion does
+ * exactly that by opening label on every hwmon node. Without it those opens
+ * fail (sysfs logs "not openable", errno -EINVAL) on every scan. */
+static int dev_label_open(sysfs_attr_t attr)
+{
+    struct hwmon_dev *dev = attr->user_data;
+    dev->dev_label_done = 0;
+    return 0;
+}
+
+static ssize_t dev_label_read(sysfs_attr_t attr, void *buf, size_t size)
+{
+    struct hwmon_dev *dev = attr->user_data;
+    ssize_t len;
+
+    if (dev->dev_label_done)
+        return 0;
+
+    len = snprintf(buf, size, "%s\n", dev->label);
+    if (len < 0)
+    {
+        LOG_ERR("%s read label fail.", dev->label);
+        return len;
+    }
+
+    if (len > size)
+        len = size;
+
+    dev->dev_label_done = 1;
+    return len;
+}
+
+static ssize_t dev_label_close(sysfs_attr_t attr)
+{
+    ARG_UNUSED(attr);
+    return 0;
+}
+
+static struct sysfs_attribute_ops dev_label_attr_ops = {
+    .open = dev_label_open,
+    .read = dev_label_read,
+    .write = NULL,
+    .close = dev_label_close,
+    .ioctl = NULL
+};
+
 static int hwmon_fs_init(void)
 {
     char path[64];
@@ -430,6 +481,15 @@ static int hwmon_fs_init(void)
         dev->name_attr.user_data = dev;
 
         sysfs_add_attribute(dev->node, &dev->name_attr);
+
+        snprintf(dev->label_attr.name,
+                 SYSFS_ATTRIBUTE_NAME_MAX,
+                 "label");
+
+        dev->label_attr.ops = &dev_label_attr_ops;
+        dev->label_attr.user_data = dev;
+
+        sysfs_add_attribute(dev->node, &dev->label_attr);
     }
 
     return 0;
