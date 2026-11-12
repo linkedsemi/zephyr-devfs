@@ -19,6 +19,20 @@
  * distinguish vin/vout, iin/iout, pin/pout; if omitted, no label file is made
  * and dbus-sensors falls back to the generic "output" property for that rail.
  *
+ * ALTERNATIVE, for chips that expose dozens of files (PMBus PSU, MOC FPGA...):
+ * name an `attr-set` instead of listing every file, e.g.
+ *
+ *     attr-set = "pmbus";     // group table lives in this file
+ *     channels = <2>;         // optional: drop files numbered > 2
+ *
+ * The set table is code, not DT, so adding a chip or a rail does not grow the
+ * board overlay. Precedence: `meas` (explicit list) wins over `attr-set`.
+ * Entry order is irrelevant -- the number inside each file name is the sensor
+ * driver's sub-channel selector (val2 = number - 1) and is parsed at read
+ * time. DT `channels = <n>` is an optional cut-off that drops files whose
+ * number is > n; omitting it keeps the whole set. Layouts whose numbering
+ * differs from the set still need `meas`.
+ *
  * At read time hwmon parses the filename itself: the prefix selects the
  * sensor_channel (in->VOLTAGE, curr->CURRENT, power->POWER, temp->AMBIENT_TEMP,
  * fan->RPM) and the number (minus 1) is passed as val2 -- the rail /
@@ -62,7 +76,7 @@ LOG_MODULE_REGISTER(hwmon_genernal, LOG_LEVEL_INF);
 enum hwmon_sensor_type {
 	HWMON_TYPE_NONE = 0,   /* legacy: no sensor-type property (deprecated) */
 	HWMON_TYPE_TEMP,
-	HWMON_TYPE_PSU,
+	HWMON_TYPE_PMBUS,
 	HWMON_TYPE_INTRUSION,
 	/* PECI CPU temperature + power (IntelCPUSensor). The Intel CPU is
 	 * on a PECI bus, not I2C, but the same hwmon sysfs interface is
@@ -84,7 +98,9 @@ enum hwmon_sensor_type {
  * per-element string-array tokens mangle ':' to '_', so per-element access is
  * unsuitable here). See HWMON_DEVICE_ENTRY / HWMON_FILES below. */
 
-#define HWMON_MAX_CHANNELS 16
+/* Sized for the biggest `attr-set` plus some headroom: a full PMBus PSU set
+ * is ~8 files, the legacy `meas` lists top out around 16. */
+#define HWMON_MAX_CHANNELS 24
 
 /* ---- i2c client (controller + address) for bus_addr ---- */
 struct hwmon_i2c_client {
@@ -133,7 +149,9 @@ struct hwmon_dev {
 	struct hwmon_i2c_client client;/* for bus_addr */
 	const char * const *files;  /* hwmon ABI filenames (from DT `meas`) */
 	size_t file_count;
-	size_t channel_num;         /* MIN(file_count, HWMON_MAX_CHANNELS) */
+	const char *attr_set_str;   /* DT `attr-set`, used when `meas` is absent */
+	uint8_t channels_req;       /* DT `channels`, 0 = keep the whole set */
+	size_t channel_num;         /* created by hwmon_dev_setup() */
 	struct hwmon_channel channels[HWMON_MAX_CHANNELS];
 	int64_t last_fetch_ms;
 	struct sysfs_node *node;
@@ -204,6 +222,11 @@ struct hwmon_dev {
 	},                                                         \
 		.files = HWMON_FILES(inst),                               \
 		.file_count = DT_INST_PROP_LEN_OR(inst, meas, 0),          \
+		.attr_set_str = COND_CODE_1(                              \
+			DT_INST_NODE_HAS_PROP(inst, attr_set),            \
+			(DT_INST_PROP(inst, attr_set)),                   \
+			(NULL)),                                          \
+		.channels_req = DT_INST_PROP_OR(inst, channels, 0),        \
 	},
 
 /* class-5 -> entry; any other class -> nothing (its `_HWMON_CLASS_<n>` is
@@ -232,8 +255,8 @@ static enum hwmon_sensor_type hwmon_type_from_str(const char *s)
 	if (!strcmp(s, "temp")) {
 		return HWMON_TYPE_TEMP;
 	}
-	if (!strcmp(s, "psu")) {
-		return HWMON_TYPE_PSU;
+	if (!strcmp(s, "pmbus")) {
+		return HWMON_TYPE_PMBUS;
 	}
 	if (!strcmp(s, "intrusion")) {
 		return HWMON_TYPE_INTRUSION;
@@ -250,7 +273,7 @@ static const char *hwmon_name_for_type(enum hwmon_sensor_type t)
 	switch (t) {
 	case HWMON_TYPE_TEMP:
 		return "temp";
-	case HWMON_TYPE_PSU:
+	case HWMON_TYPE_PMBUS:
 		return "pmbus";
 	case HWMON_TYPE_INTRUSION:
 		return "intrusion";
@@ -351,7 +374,7 @@ static int hwmon_chan_from_name(const char *name, enum sensor_channel *chan,
 	return 0;
 }
 
-/* ---- per-device channel setup from the DT `meas` file list ---- */
+/* ---- per-device channel setup: DT `meas` list, or a code-side `attr-set` ---- */
 /* forward declarations of the sysfs ops structs (defined below) */
 static struct sysfs_attribute_ops chan_attr_ops;
 static struct sysfs_attribute_ops label_attr_ops;
@@ -360,56 +383,195 @@ static struct sysfs_attribute_ops name_attr_ops;
 static struct sysfs_attribute_ops bus_addr_ops;
 static struct sysfs_attribute_ops rearm_attr_ops;
 
-static void hwmon_dev_setup(struct hwmon_dev *dev)
+/* ---- attribute sets ----
+ * A set is a code-side table of hwmon ABI files for a conventional layout, so
+ * a chip with dozens of files needs one DT line instead of dozens. The table
+ * holds FILE NAMES only -- it knows nothing about the chip's registers, scaling
+ * or rails; the sensor driver still owns all of that.
+ *
+ * Entry order is irrelevant: each file name carries its sub-channel number,
+ * which hwmon_chan_from_name() turns into the driver's rail selector
+ * (val2 = number - 1) at read time. DT `channels = <n>` therefore just drops
+ * entries whose number is > n; omitting it keeps the whole set.
+ */
+struct hwmon_set_entry {
+	const char *file;   /* "<chan><n>_input" */
+	const char *label;  /* "<chan><n>_label" content; NULL = no label file */
+};
+
+struct hwmon_attr_set {
+	const char *name;
+	const struct hwmon_set_entry *entries;
+	size_t count;
+};
+
+#define HWMON_SET_ENTRY(_file, _label) \
+	{ .file = (_file), .label = (_label) }
+
+/* Conventional single-output PMBus PSU layout, matching the example in the
+ * file header and in lsqsh_evb_cpu1.overlay: in1=vin, in3=vout1,
+ * curr1=iin1, curr2=iout1, power1=pin, power2=pout1, temp1, fan1. */
+static const struct hwmon_set_entry pmbus_set[] = {
+	HWMON_SET_ENTRY("in1_input", "vin1"),
+	HWMON_SET_ENTRY("curr1_input", "iin1"),
+	HWMON_SET_ENTRY("power1_input", "pin"),
+	HWMON_SET_ENTRY("in3_input", "vout1"),
+	HWMON_SET_ENTRY("curr2_input", "iout1"),
+	HWMON_SET_ENTRY("power2_input", "pout1"),
+	HWMON_SET_ENTRY("temp1_input", NULL),
+	HWMON_SET_ENTRY("fan1_input", NULL),
+};
+
+/* Test-stub layout: mirrors src/fake_psu.c's rail numbering (in1=vin,
+ * in2=vin1, in3=vout1, power2=pin1, power3=pout1, curr1=iout1, temp1, fan1),
+ * i.e. exactly what lsqsh_evb_cpu1_fake_psu.overlay used to list in `meas`.
+ * Differs from `pmbus` only in which sub-channel each rail maps to, so the
+ * values land on the right dbus properties with the fake driver.
+ * The labels must stay in PSUSensorMain's labelMatch table. */
+static const struct hwmon_set_entry fake_psu_set[] = {
+	HWMON_SET_ENTRY("in1_input", "vin"),
+	HWMON_SET_ENTRY("in2_input", "vin1"),
+	HWMON_SET_ENTRY("in3_input", "vout1"),
+	HWMON_SET_ENTRY("power2_input", "pin1"),
+	HWMON_SET_ENTRY("power3_input", "pout1"),
+	HWMON_SET_ENTRY("curr1_input", "iout1"),
+	HWMON_SET_ENTRY("temp1_input", "temp1"),
+	HWMON_SET_ENTRY("fan1_input", "fan1"),
+};
+
+static const struct hwmon_attr_set hwmon_attr_sets[] = {
+	{
+		.name = "pmbus",
+		.entries = pmbus_set,
+		.count = ARRAY_SIZE(pmbus_set),
+	},
+	{
+		.name = "fake-psu",
+		.entries = fake_psu_set,
+		.count = ARRAY_SIZE(fake_psu_set),
+	},
+};
+
+static const struct hwmon_attr_set *hwmon_find_set(const char *name)
 {
-	/* The file list comes straight from DT (`meas`); hwmon has no per-driver
-	 * table to look up. `name` is derived from sensor-type.
-	 *
-	 * Each `meas` entry is "<chan><n>_input" with an OPTIONAL ":<label>"
-	 * suffix, e.g. "in3_input:vout1". The part before ':' is the value file
-	 * (the driver read path); the part after ':' becomes the content of a
-	 * companion "<chan><n>_label" file. */
-	dev->name_str = hwmon_name_for_type(dev->type);
-	dev->channel_num = MIN(dev->file_count, HWMON_MAX_CHANNELS);
-	dev->last_fetch_ms = 0;
-
-	for (size_t i = 0; i < dev->channel_num; i++) {
-		struct hwmon_channel *ch = &dev->channels[i];
-		const char *entry = dev->files[i];
-		const char *colon = strchr(entry, ':');
-		int fn_len = colon ? (int)(colon - entry) : (int)strlen(entry);
-
-		ch->dev = dev;
-		ch->read_done = false;
-		ch->label_done = false;
-		k_poll_signal_init(&ch->poll_signal);
-
-		/* value file: copy just the "<chan><n>_input" part (before ':') */
-		snprintf(ch->attr.name, SYSFS_ATTRIBUTE_NAME_MAX, "%.*s",
-			 fn_len, entry);
-		ch->filename = ch->attr.name;
-		ch->attr.user_data = ch;
-		ch->attr.ops = &chan_attr_ops;
-
-		/* optional label file: name = value name with "input"->"label",
-		 * content = the DT-supplied text after ':'. */
-		ch->has_label = false;
-		ch->label = NULL;
-		if (colon && colon[1] != '\0') {
-			snprintf(ch->label_attr.name, SYSFS_ATTRIBUTE_NAME_MAX,
-				 "%s", ch->filename);
-
-			char *p = strstr(ch->label_attr.name, "input");
-
-			if (p) {
-				memcpy(p, "label", 5);/* same length */
-				ch->label = colon + 1;/* points into DT string */
-				ch->label_attr.user_data = ch;
-				ch->label_attr.ops = &label_attr_ops;
-				ch->has_label = true;
-			}
+	for (size_t i = 0; i < ARRAY_SIZE(hwmon_attr_sets); i++) {
+		if (!strcmp(hwmon_attr_sets[i].name, name)) {
+			return &hwmon_attr_sets[i];
 		}
 	}
+	return NULL;
+}
+
+/* Append one channel (value file + optional label file) to `dev`. `label` must
+ * stay valid for the lifetime of the node: either a string literal from a set
+ * table or the tail of a DT string. */
+static void hwmon_chan_add(struct hwmon_dev *dev, const char *file,
+			   const char *label)
+{
+	if (dev->channel_num >= HWMON_MAX_CHANNELS) {
+		LOG_WRN("%s: too many hwmon files, %s dropped", dev->label, file);
+		return;
+	}
+
+	struct hwmon_channel *ch = &dev->channels[dev->channel_num++];
+
+	ch->dev = dev;
+	ch->read_done = false;
+	ch->label_done = false;
+	k_poll_signal_init(&ch->poll_signal);
+
+	snprintf(ch->attr.name, sizeof(ch->attr.name), "%s", file);
+	ch->filename = ch->attr.name;
+	ch->attr.user_data = ch;
+	ch->attr.ops = &chan_attr_ops;
+
+	/* optional label file: name = value name with "input"->"label". */
+	ch->has_label = false;
+	ch->label = NULL;
+	if (label != NULL && label[0] != '\0') {
+		snprintf(ch->label_attr.name, sizeof(ch->label_attr.name), "%s",
+			 file);
+
+		char *p = strstr(ch->label_attr.name, "input");
+
+		if (p) {
+			memcpy(p, "label", 5);/* same length */
+			ch->label = label;
+			ch->label_attr.user_data = ch;
+			ch->label_attr.ops = &label_attr_ops;
+			ch->has_label = true;
+		}
+	}
+}
+
+static void hwmon_dev_setup(struct hwmon_dev *dev)
+{
+	dev->name_str = hwmon_name_for_type(dev->type);
+	dev->last_fetch_ms = 0;
+	dev->channel_num = 0;
+
+	/* 1) Explicit `meas` list wins (backward compatible: every existing board
+	 * DT keeps working unchanged). */
+	if (dev->file_count > 0) {
+		for (size_t i = 0; i < dev->file_count; i++) {
+			const char *entry = dev->files[i];
+			const char *colon = strchr(entry, ':');
+			size_t fn_len = colon ? (size_t)(colon - entry)
+					      : strlen(entry);
+			char file[SYSFS_ATTRIBUTE_NAME_MAX + 1];
+
+			if (fn_len > SYSFS_ATTRIBUTE_NAME_MAX) {
+				LOG_ERR("%s: meas entry too long: %s",
+					dev->label, entry);
+				continue;
+			}
+			memcpy(file, entry, fn_len);
+			file[fn_len] = '\0';
+			hwmon_chan_add(dev, file,
+				       (colon != NULL) ? colon + 1 : NULL);
+		}
+		return;
+	}
+
+	/* 2) `attr-set`: expand the code-side table. Entry order is irrelevant;
+	 * the sub-channel number inside each file name is what the read path
+	 * turns into val2. DT `channels = <n>` (optional) merely drops files
+	 * whose number is > n; without it the whole set is created. */
+	if (dev->attr_set_str != NULL) {
+		const struct hwmon_attr_set *set =
+			hwmon_find_set(dev->attr_set_str);
+
+		if (set == NULL) {
+			LOG_ERR("%s: unknown attr-set '%s'", dev->label,
+				dev->attr_set_str);
+			return;
+		}
+
+		for (size_t i = 0; i < set->count; i++) {
+			enum sensor_channel chan;
+			int num = 0;
+
+			/* A name hwmon cannot parse is still added (the read
+			 * path reports it per file) -- but it never matches the
+			 * `channels` cut-off either. */
+			if (dev->channels_req != 0 &&
+			    hwmon_chan_from_name(set->entries[i].file, &chan,
+						 &num) == 0 &&
+			    num > (int)dev->channels_req) {
+				continue;
+			}
+			hwmon_chan_add(dev, set->entries[i].file,
+				       set->entries[i].label);
+		}
+
+		LOG_INF("%s: attr-set '%s' -> %u file(s), channels=%u",
+			dev->label, set->name, (unsigned int)dev->channel_num,
+			(unsigned int)dev->channels_req);
+		return;
+	}
+
+	LOG_WRN("%s: neither `meas` nor `attr-set` given; no channel files",
+		dev->label);
 }
 
 /* ---- channel attribute ops ---- */
