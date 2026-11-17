@@ -27,6 +27,13 @@ LOG_MODULE_REGISTER(hwmon_adc, LOG_LEVEL_INF);
  * rank counter per ADC device (LSQSH has adc1/adc2). */
 #define HWMON_ADC_DEV_MAX           2
 
+/*
+ * ADC_REF_VDD_1 uses the nominal 3.3 V VDD reference. The LSQSH ADC driver
+ * currently programs 12-bit conversion with ADC_ADC_RES_MASK.
+ */
+#define HWMON_ADC_VREF_MV           3300
+#define HWMON_ADC_RESOLUTION_BITS   12
+
 #define _HWMON_CLASS_2                  1
 #define HWMON_CLASS_TO_FLAG_RAW(x)      _HWMON_CLASS_##x
 #define HWMON_CLASS_TO_FLAG(x)          HWMON_CLASS_TO_FLAG_RAW(x)
@@ -169,7 +176,7 @@ static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
         .buffer = values,
         .buffer_size = sizeof(values),
         .channels = adc->channel,
-        // .resolution = 12,
+        .resolution = HWMON_ADC_RESOLUTION_BITS,
     };
 
     ret = adc_read(adc->dev, &sequence);
@@ -183,7 +190,17 @@ static ssize_t adc_attr_read(sysfs_attr_t attr, void *buf, size_t size)
 
     LOG_DBG("%s channel (%d) value: %u.", adc->dev->name, adc->channel, value);
 
-    int len = snprintf(buf, size, "%u\n", value);
+    int32_t millivolts = value;
+    ret = adc_raw_to_millivolts(HWMON_ADC_VREF_MV, ADC_GAIN_1,
+                                HWMON_ADC_RESOLUTION_BITS, &millivolts);
+    if (ret)
+    {
+        LOG_ERR("%s channel (%d) conversion fail: %d.",
+                adc->dev->name, adc->channel, ret);
+        return ret;
+    }
+
+    int len = snprintf(buf, size, "%d\n", millivolts);
 
     if (len > 0)
     {
